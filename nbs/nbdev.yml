@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "vnnpaper"
+  site-url: "https://DanielKick-USDA.github.io/vnnpaper"
+  description: "Manuscript figures using sparsevnn."
+  repo-branch: main
+  repo-url: "https://github.com/DanielKick-USDA/vnnpaper"
