@@ -1,3 +1,9 @@
+## Project Specific
+/nbs_artifacts
+/nbs/*.py
+/nbs/nohup.out
+
+## nbdev defaults
 _docs/
 _proc/
 
