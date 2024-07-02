@@ -1,5 +1,10 @@
 ## Project Specific
 /nbs_artifacts
+!/nbs_artifacts/zma_g2f_individual_gapit
+!/nbs_artifacts/zma_g2f_individual_gapit/gapit.def
+!/nbs_artifacts/zma_g2f_individual_gapit/Readme
+!/nbs_artifacts/zma_g2f_individual_gapit/01_mkqueue.sh
+!/nbs_artifacts/zma_g2f_individual_gapit/02_next.sh
 /nbs/*.py
 /nbs/nohup.out
 
