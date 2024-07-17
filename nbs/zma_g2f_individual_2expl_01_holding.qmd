@@ -49,6 +49,21 @@ from ax.service.ax_client import AxClient, ObjectiveProperties
 import re
 import yaml # to parse hparams.yaml into dictionaries
 import plotly.express as px
+
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+from plotnine import ggplot, \
+    geom_point, \
+    geom_line, \
+    geom_area, \
+    aes, \
+    stat_smooth, \
+    facet_wrap
+
+from tqdm import tqdm
 ```
 
 ```{python}
@@ -402,7 +417,6 @@ parsed_kegg_gene_entries = get_data('KEGG_entries')      # 'KEGG_entries': 'filt
 ACGT_gene_slice_list[0].shape, len(ACGT_gene_slice_loci[0])
 ```
 
-
 ```{python}
 # make sure that the given y variable is there
 # single column version
@@ -521,6 +535,7 @@ M_list = vnn_factory_2(vnn_helper = myvnn, node_to_inp_num_dict = new_lookup_dic
 
 ### Setup Dataloader using `M_list`
 
+
 ```{python}
 lookup_dict = new_lookup_dict
 
@@ -536,14 +551,31 @@ vals = vals.to('cuda')
 ```
 
 ```{python}
-# build the site lookup for vals
+## build the site lookup for vals ====
 vals_loci = [ACGT_gene_slice_loci[lookup_dict[i]] for i in M_list[0].row_inp]
 vals_loci = sum(vals_loci, [])
 # confirm there are equal loci and input snps
 assert vals.shape[1]/4 == len(vals_loci)
+
+## build up a vals_loci reference, a column on entrys for each loci ====
+vals_entry = [ 
+    [parsed_kegg_gene_entries[lookup_dict[i]]['ENTRY'] 
+     for j in range(len(ACGT_gene_slice_loci[lookup_dict[i]]))]
+     for i in M_list[0].row_inp
+ ]
+
+vals_entry = sum(vals_entry, [])
+# confirm there are equal loci and input snps
+assert vals.shape[1]/4 == len(vals_entry)
+
+
+# package into a df 
+vals_lookup_df = pd.DataFrame(zip(vals_loci.copy(), vals_entry.copy()), columns= ['snp', 'entry'])
+vals_lookup_df
 ```
 
 ```{python}
+# quick addition to filter hmp for gwas
 with open('./vals_loci_filter.txt', 'w') as f:
     for e in vals_loci:
         f.writelines('\t'.join(e[1:].split('_'))+'\n')
@@ -593,9 +625,193 @@ class NeuralNetwork(nn.Module):
 
 ## Load results and examine
 
-### Within Model:
 
-#### Hyperparmeter performance variability:
+
+## Get Benchmark Performance
+
+### bWGR BLUP
+
+```{python}
+def _get_bWGR_res(
+        exp_yvar = 'eres_Yield_Mg_ha', 
+        result_name = 'hat' # must be one of 'hmp_info', 'hat', or b
+        ):
+    result_path = f'../nbs_artifacts/zma_g2f_individual_bWGR_all/output/phno_all_{exp_yvar}__5_Genotype_Data_All_Years_vals_loci'
+    if result_name != 'hmp_info':
+        x = pd.read_table(result_path+f'/fm_{result_name}.txt', sep=' ').reset_index()
+
+    match result_name:
+        case 'hmp_info':
+             # special case that loads in the info for the snps
+            with open('../nbs_artifacts/zma_g2f_individual_bWGR_all/genotypes/5_Genotype_Data_All_Years_vals_loci.hmp.txt', 'r') as f:
+                x = f.readlines()
+            x = [e.split('\t')[0:4] for e in x]
+            x = pd.DataFrame(x[1:], columns= x[0])
+
+        case 'hat':
+             obs = pd.read_table(f'../nbs_artifacts/zma_g2f_individual_bWGR_all/phenotypes/phno_all_{exp_yvar}.txt', sep='\t', skiprows=2)
+             x = x.rename(columns={'index':'Taxa', 'V1':'YHat'}).drop(columns='Taxa')
+             x = pd.concat([obs, x], axis=1)
+        
+        case 'b':
+             x = x.rename(columns={'index':'SNP_int', 'x':'b'})
+        
+        case _:
+            print(f'{result_name} is not implmented, returning none.')
+            x = None
+    
+    return x
+```
+
+```{python}
+
+# Here's how to get snp specific effects
+x = pd.concat([_get_bWGR_res(exp_yvar = 'eres_Yield_Mg_ha', result_name='hmp_info'), 
+               _get_bWGR_res(exp_yvar = 'eres_Yield_Mg_ha', result_name='b')], axis=1)
+x['abs_b'] = x.b.abs()
+x
+```
+
+```{python}
+px.scatter(x.reset_index(), 'index', 'abs_b', color='chrom')
+```
+
+```{python}
+x = _get_bWGR_res(exp_yvar = 'eres_Yield_Mg_ha', result_name='hat')
+x
+```
+
+```{python}
+print(f'MSE: {(x.Yield_Mg_ha - x.YHat).pow(2).mean()}')
+px.scatter(x, 'Yield_Mg_ha', 'YHat')
+```
+
+```{python}
+# For all exp_yvar below
+# get b -> pseudo manhattan
+# get yhats -> performance benchmark
+
+exp_yvars = [
+# TODO run on all yvars
+ 'Ear_Height_cm',
+ 'Grain_Moisture',
+ 'Plant_Height_cm',
+ 'Pollen_DAP_days',
+ 'Silk_DAP_days',
+ 'Twt_kg_m3',
+ 'Yield_Mg_ha',
+ 'eres_Ear_Height_cm',
+ 'eres_Grain_Moisture',
+ 'eres_Plant_Height_cm',
+ 'eres_Pollen_DAP_days',
+ 'eres_Silk_DAP_days',
+ 'eres_Twt_kg_m3',
+ 'eres_Yield_Mg_ha']
+
+exp_yvar = exp_yvars[-1]
+
+# cache_path
+# table = pa.Table.from_pandas(table)
+# pq.write_table(table, 'table.parquet')
+# x1 = pq.read_table('table.parquet').to_pandas()
+```
+
+```{python}
+## Accumulate and save out the model b terms with snp annotations ====
+x = [pd.concat([
+    _get_bWGR_res(exp_yvar = exp_yvar, result_name='hmp_info'), 
+    _get_bWGR_res(exp_yvar = exp_yvar, result_name='b')], axis=1).rename(columns={'b': f'b_{exp_yvar}'}) 
+    for exp_yvar in exp_yvars
+    ]
+# merge summary dataframe into a large table
+out = x[0]
+for xx in x[1:]:
+    out = out.merge(xx)
+
+pq.write_table(pa.Table.from_pandas(out), f'{cache_path}benchmark_bWGR_b_{exp_yvar}.parquet')
+out.head()
+```
+
+```{python}
+## Save out the model predictions ====
+# because there are a different number of observations for each yvar we can't cbind them. If I deduped the predictions then the observed would need be cut. 
+# For that reason I'll just save them from the list comp.
+_ = [pq.write_table(
+    pa.Table.from_pandas(
+        _get_bWGR_res(exp_yvar = exp_yvar, result_name='hat').rename(columns={'YHat':f'{exp_yvar}_YHat'})
+    ), 
+    f'{cache_path}benchmark_bWGR_hat_{exp_yvar}.parquet')
+    for exp_yvar in exp_yvars
+    ]
+```
+
+### GWAS on BLUEs
+
+```{python}
+def _get_gwas_results(
+    gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_gapit/output/',
+    gwas_phno = 'Ear_Height_cm',
+    gwas_geno = '5_Genotype_Data_All_Years_acgt_30000'
+    ):
+    gwas_result_path = gwas_output_dir+f'phno_{gwas_phno}__{gwas_geno}'
+    gwas_result_name = [e for e in os.listdir(gwas_result_path) if re.match('GAPIT.Association.GWAS_Results', e)][0]
+    out = pd.read_csv(gwas_result_path+'/'+gwas_result_name)
+    return out
+```
+
+```{python}
+def _standardize_names(df, name_dict = {'Pos':'pos', 'Chr':'chrom'}):
+    "Replace specified names and then remove any '.' in any name and set all to lowercase"
+    df = df.rename(columns = name_dict)
+    df = df.rename(columns = {e:e.replace('.', '').lower() for e in list(df)})
+    return df
+```
+
+```{python}
+_ = [pq.write_table(
+    pa.Table.from_pandas(
+        _standardize_names(
+            _get_gwas_results(
+                gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_bWGR_all_gapit_blink/output/',
+                gwas_phno = exp_yvar,
+                gwas_geno = '5_Genotype_Data_All_Years_vals_loci'
+                )
+            )
+        ), 
+    f'{cache_path}benchmark_bWGR_blink_{exp_yvar}.parquet')
+    for exp_yvar in exp_yvars
+    ]
+```
+
+### Just in case GWAS on non-blues?
+
+```{python}
+_ = [pq.write_table(
+    pa.Table.from_pandas(
+        _standardize_names(
+            _get_gwas_results(
+                gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_gapit_blink/output/',
+                gwas_phno = exp_yvar,
+                gwas_geno = '5_Genotype_Data_All_Years_vals_loci'
+                )
+            )
+        ), 
+    f'{cache_path}benchmark_mean_blink_{exp_yvar}.parquet')
+    for exp_yvar in exp_yvars
+
+#TODO I will need to rerun these. Likely an issue with 02_next.sh
+    if exp_yvar not in [
+    'Grain_Moisture',
+    'Twt_kg_m3',
+    'eres_Grain_Moisture',
+    'eres_Twt_kg_m3',
+    ]
+    ]
+```
+
+## Get Alternate Model Performance
+
+### Hyperparameter placeholder
 
 ```{python}
 # JSON path and log dir
@@ -636,19 +852,6 @@ def read_hyp_exp_results(exp_name, exp_yvar, **kwargs):
         return (AxClient.load_from_json_file(filepath = json_path), metrics)
     else:
         return metrics
-```
-
-```{python}
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-#TODO
-# write to parquet files so I can make the figured I want in ggplot+patchwork
-
-# table = pa.Table.from_pandas(table)
-# pq.write_table(table, 'table.parquet')
-
-# x1 = pq.read_table('table.parquet').to_pandas()
 ```
 
 ```{python}
@@ -711,11 +914,11 @@ df_scale = df.copy()
 ```{python}
 df_scale = (df_scale - df_scale.min()) / (df_scale.max() - df_scale.min())
 
-px.imshow(df_scale)
+# px.imshow(df_scale)
 ```
 
 ```{python}
-px.line(df, x = df.index, y = 'train_loss', title= 'Minimum Loss')
+# px.line(df, x = df.index, y = 'train_loss', title= 'Minimum Loss')
 ```
 
 ```{python}
@@ -727,72 +930,149 @@ tmp = tmp.merge(
         [[i,j] for i in range(4) for j in range(8)], columns=['row', 'col']
     ).reset_index().rename(columns={'index':'version'})
 )
+
+tmp.head()
 ```
 
 ```{python}
-px.line(
-    tmp.loc[
-        (tmp.split == 'train_loss'), 
-        ].groupby(['version', 'epoch', 'row', 'col']).agg(loss = ('loss', 'mean')).reset_index(),
-    x = 'epoch', y = 'loss', 
-    line_group='version', 
-    # color='version', 
-    # facet_col='version'
-    facet_col= 'col',
-    facet_row='row'
+# px.line(
+#     tmp.loc[
+#         (tmp.split == 'train_loss'), 
+#         ].groupby(['version', 'epoch', 'row', 'col']).agg(loss = ('loss', 'mean')).reset_index(),
+#     x = 'epoch', y = 'loss', 
+#     line_group='version', 
+#     # color='version', 
+#     # facet_col='version'
+#     facet_col= 'col',
+#     facet_row='row'
+#     )
+```
+
+```{python}
+# px.line(
+#     tmp.loc[
+#         (tmp.split == 'val_loss'), 
+#         ].groupby(['version', 'epoch', 'row', 'col']).agg(loss = ('loss', 'mean')).reset_index(),
+#     x = 'epoch', y = 'loss', 
+#     line_group='version', 
+#     # color='version', 
+#     # facet_col='version'
+#     facet_col= 'col',
+#     facet_row='row',
+#     # log_y=True
+#     )
+```
+
+```{python}
+
+# (
+#     ggplot(metrics, aes("epoch", "loss", color="version"))
+#     + geom_point()
+#     # + stat_smooth(method="lm")
+#     + facet_wrap("split")
+# )
+```
+
+```{python}
+# (
+#     ggplot(metrics.loc[(metrics.version > 28), ], aes("epoch", "loss", color="version"))
+#     + geom_line()
+#     # + stat_smooth(method="lm")
+#     + facet_wrap("split")
+# )
+```
+
+
+```{python}
+# exp_yvar = [
+#         'Yield_Mg_ha',
+#         # 'Pollen_DAP_days',
+#         # 'Silk_DAP_days',
+#         # 'Plant_Height_cm',
+#         # 'Ear_Height_cm',
+#         # 'Grain_Moisture',
+#         # 'Twt_kg_m3',
+#         ][0]
+
+# exp_name = ['zma_g2f_individual_0hyps', 'zma_g2f_individual_eres_0hyps'][0]
+
+
+metrics_list = []
+df_list = []
+
+
+for exp_name, exp_yvar in [
+    (i,j) for i in 
+    ['zma_g2f_individual_0hyps', 'zma_g2f_individual_eres_0hyps']
+    for j in ['Yield_Mg_ha', 'Pollen_DAP_days', 'Silk_DAP_days', 
+              'Plant_Height_cm', 'Ear_Height_cm', 'Grain_Moisture', 'Twt_kg_m3',]]:
+    
+    # zma_g2f_individual_eres_0hyps Grain_Moisture
+    print(exp_name, exp_yvar)
+
+
+    #FIXME the json file for 
+    # exp_name = 'zma_g2f_individual_eres_0hyps',
+    # exp_yvar = 'Grain_Moisture'
+    # doesn't exist. Unclear why but that may need to be rerun 
+    # For now I'm using this workaround.
+    res = read_hyp_exp_results(
+        exp_name = exp_name,
+        exp_yvar = exp_yvar
+    )
+
+    # This is the case for Grain_Moisture
+    if type(res) == pd.core.frame.DataFrame:
+        metrics = res
+        metrics['exp_name'] = exp_name
+        metrics['exp_yvar'] = exp_yvar
+        metrics_list.append(metrics)
+
+    if type(res) == tuple:
+        ax_client, metrics = res
+
+        df = ax_client.get_trials_data_frame()
+        df = df.loc[:, [
+            'train_loss',
+            'default_out_nodes_inp',
+            'default_out_nodes_edge',
+            'default_drop_nodes_inp',
+            'default_drop_nodes_edge',
+            'default_drop_nodes_out',
+            'default_reps_nodes_inp',
+            'default_reps_nodes_edge',
+            'default_reps_nodes_out',
+            'default_decay_rate',
+            # 'default_out_nodes_out'
+            ]]
+
+        metrics['exp_name'] = exp_name
+        df['exp_name']      = exp_name
+
+        metrics['exp_yvar'] = exp_yvar
+        df['exp_yvar']      = exp_yvar
+
+        metrics_list.append(metrics)
+        df_list.append(df)
+```
+
+```{python}
+pq.write_table(
+    pa.Table.from_pandas(pd.concat(df_list, axis=0)), 
+    f'{cache_path}alternate_0hyps_tuner.parquet'
+    )
+
+
+pq.write_table(
+    pa.Table.from_pandas(pd.concat(metrics_list, axis=0)), 
+    f'{cache_path}alternate_0hyps_history.parquet'
     )
 ```
 
-```{python}
-px.line(
-    tmp.loc[
-        (tmp.split == 'val_loss'), 
-        ].groupby(['version', 'epoch', 'row', 'col']).agg(loss = ('loss', 'mean')).reset_index(),
-    x = 'epoch', y = 'loss', 
-    line_group='version', 
-    # color='version', 
-    # facet_col='version'
-    facet_col= 'col',
-    facet_row='row',
-    # log_y=True
-    )
-```
 
-```{python}
-from plotnine import ggplot, \
-    geom_point, \
-    geom_line, \
-    geom_area, \
-    aes, \
-    stat_smooth, \
-    facet_wrap
+### Model Performance:
 
-(
-    ggplot(metrics, aes("epoch", "loss", color="version"))
-    + geom_point()
-    # + stat_smooth(method="lm")
-    + facet_wrap("split")
-)
-```
-
-```{python}
-tmp
-```
-
-```{python}
-(
-    ggplot(metrics.loc[(metrics.version > 28), ], aes("epoch", "loss", color="version"))
-    + geom_line()
-    # + stat_smooth(method="lm")
-    + facet_wrap("split")
-)
-```
-
-#### Performance over CV:
-
-```{python}
-os.listdir('../nbs_artifacts/zma_g2f_individual_1mods/lightning')
-```
+#### History
 
 ```{python}
 # get model results table
@@ -822,31 +1102,48 @@ def _get_1mods(exp_name = 'zma_g2f_individual_1mods'):
     hparams = pd.concat([_get_version_holdouts(exp_name, version) for version in versions])
 
     return metrics.merge(hparams)
+```
 
+```{python}
+os.listdir('../nbs_artifacts/zma_g2f_individual_1mods/lightning')
+```
+
+```{python}
+## History for all models (across cvs) ====
 metrics = _get_1mods(exp_name = 'zma_g2f_individual_1mods')
+
+
+pq.write_table(
+    pa.Table.from_pandas(metrics), 
+    f'{cache_path}alternate_1mods_history.parquet'
+    )
+
+
+metrics.head()
 ```
 
 ```{python}
-metrics = metrics.groupby(['holdout_parents', 'split', 'epoch', 'version']).agg(loss = ('loss', 'mean')).reset_index()
+metrics = metrics.loc[(metrics.y_var == 'Yield_Mg_ha'), ].groupby(['holdout_parents', 'split', 'epoch', 'version']).agg(loss = ('loss', 'mean')).reset_index()
+metrics
 ```
 
 ```{python}
-(
-    ggplot(metrics.loc[metrics.split == 'train_loss', ], aes("epoch", "loss", color="holdout_parents", group='version'))
-    + geom_line()
-    + facet_wrap("holdout_parents")
-)
+# (
+#     ggplot(metrics.loc[metrics.split == 'train_loss', ], aes("epoch", "loss", color="holdout_parents", group='version'))
+#     + geom_line()
+#     + facet_wrap("holdout_parents")
+# )
 ```
 
 ```{python}
-(
-    ggplot(metrics.loc[metrics.split == 'val_loss', ], aes("epoch", "loss", color="holdout_parents", group='version'))
-    + geom_line()
-    + facet_wrap("holdout_parents")
-)
+# (
+#     ggplot(metrics.loc[metrics.split == 'val_loss', ], aes("epoch", "loss", color="holdout_parents", group='version'))
+#     + geom_line()
+#     + facet_wrap("holdout_parents")
+# )
 ```
 
-#### Salience over CV:
+#### Model Predictions
 
 ```{python}
 # get model results table
@@ -869,18 +1166,543 @@ def _identify_1mods_models(
         })
 
     return out   
-
-
-model_info = _identify_1mods_models(
-        exp_name = 'zma_g2f_individual_1mods',
-        y_var = 'Yield_Mg_ha')
-model_info
 ```
 
 ```{python}
-model = torch.load(
-    model_info[0]['path']
+# model_info = _identify_1mods_models(
+#         exp_name = 'zma_g2f_individual_1mods',
+#         y_var = 'Yield_Mg_ha')
+# model_info[0]
+
+# _identify_1mods_models(
+#         exp_name = 'zma_g2f_individual_eres_1mods',
+#         y_var = 'Yield_Mg_ha')
+```
+
+```{python}
+def _prep_data_for_prediction(
+        params_data
+        ):
+    y_var = params_data['y_var']
+
+    # Data Prep ----
+    phno                     = get_data('phno')
+    # make sure that the given y variable is there
+    # single column version
+    # phno = phno.loc[(phno[y_var].notna()), ].copy()
+    # phno = phno.reset_index().drop(columns='index')
+
+    # multicolumn
+    # mask based on the y variables
+    na_array = phno[y_var].isna().to_numpy().sum(axis=1)
+    mask_no_na = list(0 == na_array)
+
+    phno = phno.loc[mask_no_na, ].copy()
+    phno = phno.reset_index().drop(columns='index')
+
+
+    # update obs_geno_lookup
+    tmp = phno.reset_index().rename(columns={'index': 'Phno_Idx_new'}).loc[:, ['Phno_Idx_new', 'Geno_Idx']]
+    tmp = pd.merge(tmp,
+            tmp.drop(columns='Phno_Idx_new').drop_duplicates().reset_index().rename(columns={'index': 'Phno_Idx_Orig_new'}))
+    tmp = tmp.sort_values('Phno_Idx_new').reset_index(drop=True)
+
+    obs_geno_lookup = tmp.to_numpy()
+    
+    
+    # make holdout sets
+    holdout_parents = params_data['holdout_parents']
+
+    
+    # create a mask for parent genotype
+    mask = mask_parents(df= phno, col_name= 'Hybrid', holdout_parents= holdout_parents)
+
+    train_mask = mask.sum(axis=1) == 0
+    test_mask  = mask.sum(axis=1) > 0
+
+    train_idx = train_mask.loc[train_mask].index
+    test_idx  = test_mask.loc[test_mask].index
+
+
+    # convert y to residual if needed
+    if params_data['y_resid'] == 'None':
+        pass
+    else:
+        if params_data['y_resid_strat'] == 'naive_mean':
+            # use only data in the training set (especially since testers will be more likely to be found across envs)
+            # get enviromental means, subtract from observed value
+            for i in range(len(y_var)):
+                tmp = phno.loc[train_idx, ]
+                env_mean = tmp.groupby(['Env_Idx']
+                            ).agg(Env_Mean = (y_var[i], 'mean')
+                            ).reset_index()
+                tmp = phno.merge(env_mean)
+                tmp.loc[:, y_var[i]] = tmp.loc[:, y_var[i]] - tmp.loc[:, 'Env_Mean']
+                phno = tmp.drop(columns='Env_Mean')
+
+        if params_data['y_resid_strat'] == 'filter_mean':
+            # for adjusting to environment we could use _all_ observations but ideally we will use the same set of genotypes across all observations
+            def minimum_hybrids_for_env(tmp = phno.loc[:, ['Env', 'Year', 'Hybrid']],
+                                        year = 2014):
+                # Within each year what hybrids are most common?
+                tmp = tmp.loc[(tmp.Year == year), ].groupby(['Env', 'Hybrid']).count().reset_index().sort_values('Year')
+
+                all_envs = set(tmp.Env)
+                # if we filter on the number of sites a hybrid is planted at, what is the largest number of sites we can ask for before we lose a location?
+                # site counts for sets which contain all envs
+                i = max([i for i in list(set(tmp.Year)) if len(set(tmp.loc[(tmp.Year >= i), 'Env'])) == len(all_envs)])
+
+                before = len(set(tmp.loc[:, 'Hybrid']))
+                after  = len(set(tmp.loc[(tmp.Year >= i), 'Hybrid']))
+                print(f'Reducing {year} hybrids from {before} to {after} ({round(100*after/before)}%).')
+                tmp = tmp.loc[(tmp.Year >= i), ['Env', 'Hybrid']].reset_index(drop=True)
+                return tmp
+
+            for i in range(len(y_var)):
+                tmp = phno.loc[:, ['Env', 'Year', 'Hybrid']]
+                filter_hybrids = [minimum_hybrids_for_env(tmp = phno.loc[:, ['Env', 'Year', 'Hybrid']], year = i) 
+                                for i in list(set(phno.Year)) ]
+                env_mean = pd.concat(filter_hybrids).merge(phno, how = 'left')
+
+                env_mean = env_mean.groupby(['Env_Idx']
+                                ).agg(Env_Mean = (y_var[i], 'mean')
+                                ).reset_index()
+
+                tmp = phno.merge(env_mean)
+                tmp.loc[:, y_var[i]] = tmp.loc[:, y_var[i]] - tmp.loc[:, 'Env_Mean']
+                phno = tmp.drop(columns='Env_Mean')
+
+
+    # center and y value data
+    assert 0 == phno.loc[:, y_var].isna().sum().sum() # second sum is for multiple y_vars
+
+    y = phno.loc[:, y_var].to_numpy() # added to make multiple ys work
+    # use train index to prevent information leakage
+    y_c = y[train_idx].mean(axis=0)
+    y_s = y[train_idx].std(axis=0)
+
+    y = (y - y_c)/y_s
+
+    # y, y_c, y_s
+
+    ## Ref df of targets ==== 
+    phno_out = phno.copy()
+    phno_out = phno_out.loc[:, ['Hybrid']+y_var]
+    phno_out.loc[:, 'Train'] = False
+    phno_out.loc[train_idx, 'Train'] = True
+    phno_out['center'] = float(y_c[0])
+    phno_out['scale'] = float(y_s[0])
+
+
+    ## df to cbind in yhats ====
+    # # here are the values for each hybrid
+    # idx_of_genos = pd.DataFrame(obs_geno_lookup
+    #                 ).loc[:, [1, 2]
+    #                 ].drop_duplicates(
+    #                 ).sort_values(1, ascending=True
+    #                 ).loc[:, 2].values.tolist()
+    # Hybrids = phno.loc[idx_of_genos, 'Hybrid'].values.tolist()
+    # out = pd.DataFrame({'Hybrid':Hybrids, 'geno_idx':idx_of_genos})
+    # out = pd.DataFrame(yhat, columns=[f'hat_{"_".join(y_var)}'])
+    # out['Hybrids'] = Hybrids
+
+    # Create a deduplicated df of the hybrids with the index info for vals (ig)
+    idx_of_genos = pd.DataFrame(obs_geno_lookup, columns = ['iy', 'ig', 'iy1'])
+    tmp = idx_of_genos.loc[:, ['iy1']].drop_duplicates()
+    tmp.loc[:, 'Hybrid'] = phno.loc[(tmp['iy1'].values.tolist()), 'Hybrid'].values.tolist()
+    idx_of_genos = idx_of_genos.loc[:, ['ig', 'iy1']
+                              ].merge(tmp
+                              ).drop_duplicates(
+                              ).reset_index(drop=True
+                              ).drop(columns = 'iy1')
+
+    return phno_out, idx_of_genos
+```
+
+
+```{python}
+exp_names = ['zma_g2f_individual_1mods', 'zma_g2f_individual_eres_1mods']
+
+
+# exp_name  = exp_names[0]
+# exp_yvar = 'Yield_Mg_ha' #exp_yvars[0]
+
+for exp_name, exp_yvar in [(i,j) for i in exp_names for j in exp_yvars]:
+
+    models_info = _identify_1mods_models(exp_name = exp_name, y_var = exp_yvar)
+    if models_info == []: # confirm there are models to load (e.g. exp_name is eres in non eres exp.)
+        pass
+    else:
+        # model_info = models_info[0]
+        for model_info in tqdm(models_info):
+
+            if type(exp_yvar) != list:
+                y_var = [exp_yvar]
+
+            y_ref, yhat_hybrids =_prep_data_for_prediction(
+                    params_data = {
+                        'y_var': y_var,
+                        # set residual prediction strategy correctly
+                        'y_resid':       ['None' if re.findall('_eres_', e) == [] else 'naive_mean' for e in [exp_name]][0],
+                        'y_resid_strat': ['None' if re.findall('_eres_', e) == [] else 'naive_mean' for e in [exp_name]][0], # ignored if y_resid == "None"
+                        'holdout_parents': model_info['holdout_parents'].split('_')
+                        }
+                    )
+
+            ## Load model and run inference 
+            model = torch.load(model_info['path']).to('cuda')
+            yhat = model(vals)
+            # yhat = yhat.to('cpu').detach().numpy()
+            yhat = yhat.detach().cpu().numpy()
+
+            # index into yhat to make everything match, then overwrite and cbind
+            yhat = pd.DataFrame(yhat[yhat_hybrids.loc[:, 'ig'].values.tolist()], columns=[f'hat_{e}' for e in y_var])
+            yhat_hybrids = pd.concat([yhat_hybrids, yhat], axis=1).drop(columns='ig')
+
+            out = y_ref.merge(yhat_hybrids)
+
+
+            if_eres = ["" if re.findall("_eres_", e) == [] else "eres_" for e in [exp_name]][0]
+
+            pq.write_table(
+                pa.Table.from_pandas(out), 
+                cache_path+model_info['model_name'].replace('vnn__', f'alternate_1mods_hat__{if_eres}').replace('.pt', '.parquet')
+                )
+            
+            # explictly free up gpu space (not being released when expected)
+            del model
+            torch.cuda.empty_cache()   
+```
+
+#### Salience over CV:
+
+```{python}
+def _prep_data_to_dls(
+        # obs_geno_lookup,
+        vals,
+        batch_size,
+        params_data
+        ):
+    y_var = params_data['y_var']
+
+    # Data Prep ----
+    phno                     = get_data('phno')
+    # make sure that the given y variable is there
+    # single column version
+    # phno = phno.loc[(phno[y_var].notna()), ].copy()
+    # phno = phno.reset_index().drop(columns='index')
+
+    # multicolumn
+    # mask based on the y variables
+    na_array = phno[y_var].isna().to_numpy().sum(axis=1)
+    mask_no_na = list(0 == na_array)
+
+    phno = phno.loc[mask_no_na, ].copy()
+    phno = phno.reset_index().drop(columns='index')
+
+
+    # update obs_geno_lookup
+    tmp = phno.reset_index().rename(columns={'index': 'Phno_Idx_new'}).loc[:, ['Phno_Idx_new', 'Geno_Idx']]
+    tmp = pd.merge(tmp,
+            tmp.drop(columns='Phno_Idx_new').drop_duplicates().reset_index().rename(columns={'index': 'Phno_Idx_Orig_new'}))
+    tmp = tmp.sort_values('Phno_Idx_new').reset_index(drop=True)
+
+    obs_geno_lookup = tmp.to_numpy()
+    
+    
+    # make holdout sets
+    holdout_parents = params_data['holdout_parents']
+
+    
+    # create a mask for parent genotype
+    mask = mask_parents(df= phno, col_name= 'Hybrid', holdout_parents= holdout_parents)
+
+    train_mask = mask.sum(axis=1) == 0
+    test_mask  = mask.sum(axis=1) > 0
+
+    train_idx = train_mask.loc[train_mask].index
+    test_idx  = test_mask.loc[test_mask].index
+
+
+    # convert y to residual if needed
+    if params_data['y_resid'] == 'None':
+        pass
+    else:
+        if params_data['y_resid_strat'] == 'naive_mean':
+            # use only data in the training set (especially since testers will be more likely to be found across envs)
+            # get enviromental means, subtract from observed value
+            for i in range(len(y_var)):
+                tmp = phno.loc[train_idx, ]
+                env_mean = tmp.groupby(['Env_Idx']
+                            ).agg(Env_Mean = (y_var[i], 'mean')
+                            ).reset_index()
+                tmp = phno.merge(env_mean)
+                tmp.loc[:, y_var[i]] = tmp.loc[:, y_var[i]] - tmp.loc[:, 'Env_Mean']
+                phno = tmp.drop(columns='Env_Mean')
+
+        if params_data['y_resid_strat'] == 'filter_mean':
+            # for adjusting to environment we could use _all_ observations but ideally we will use the same set of genotypes across all observations
+            def minimum_hybrids_for_env(tmp = phno.loc[:, ['Env', 'Year', 'Hybrid']],
+                                        year = 2014):
+                # Within each year what hybrids are most common?
+                tmp = tmp.loc[(tmp.Year == year), ].groupby(['Env', 'Hybrid']).count().reset_index().sort_values('Year')
+
+                all_envs = set(tmp.Env)
+                # if we filter on the number of sites a hybrid is planted at, what is the largest number of sites we can ask for before we lose a location?
+                # site counts for sets which contain all envs
+                i = max([i for i in list(set(tmp.Year)) if len(set(tmp.loc[(tmp.Year >= i), 'Env'])) == len(all_envs)])
+
+                before = len(set(tmp.loc[:, 'Hybrid']))
+                after  = len(set(tmp.loc[(tmp.Year >= i), 'Hybrid']))
+                print(f'Reducing {year} hybrids from {before} to {after} ({round(100*after/before)}%).')
+                tmp = tmp.loc[(tmp.Year >= i), ['Env', 'Hybrid']].reset_index(drop=True)
+                return tmp
+
+            for i in range(len(y_var)):
+                tmp = phno.loc[:, ['Env', 'Year', 'Hybrid']]
+                filter_hybrids = [minimum_hybrids_for_env(tmp = phno.loc[:, ['Env', 'Year', 'Hybrid']], year = i) 
+                                for i in list(set(phno.Year)) ]
+                env_mean = pd.concat(filter_hybrids).merge(phno, how = 'left')
+
+                env_mean = env_mean.groupby(['Env_Idx']
+                                ).agg(Env_Mean = (y_var[i], 'mean')
+                                ).reset_index()
+
+                tmp = phno.merge(env_mean)
+                tmp.loc[:, y_var[i]] = tmp.loc[:, y_var[i]] - tmp.loc[:, 'Env_Mean']
+                phno = tmp.drop(columns='Env_Mean')
+
+
+    # center and y value data
+    assert 0 == phno.loc[:, y_var].isna().sum().sum() # second sum is for multiple y_vars
+
+    y = phno.loc[:, y_var].to_numpy() # added to make multiple ys work
+    # use train index to prevent information leakage
+    y_c = y[train_idx].mean(axis=0)
+    y_s = y[train_idx].std(axis=0)
+
+    y = (y - y_c)/y_s
+
+
+
+    training_dataloader = DataLoader(BigDataset(
+        lookups_are_filtered = False,
+        lookup_obs  = torch.from_numpy(np.array(train_idx)), #X.get('val:train',       ops_string='   asarray from_numpy      '),
+        lookup_geno = torch.from_numpy(obs_geno_lookup),
+        y =           torch.from_numpy(y).to(torch.float32)[:, None],
+        G =           vals,
+        G_type = 'raw',
+        send_batch_to_gpu = 'cuda:0'
+        ),
+        batch_size = batch_size,
+        shuffle = True 
     )
+
+    validation_dataloader = DataLoader(BigDataset(
+        lookups_are_filtered = False,
+        lookup_obs  = torch.from_numpy(np.array(test_idx)), #X.get('val:train',       ops_string='   asarray from_numpy      '),
+        lookup_geno = torch.from_numpy(obs_geno_lookup),
+        y =           torch.from_numpy(y).to(torch.float32)[:, None],
+        G =           vals,
+        G_type = 'raw',
+        send_batch_to_gpu = 'cuda:0'
+        ),
+        batch_size = batch_size,
+        shuffle = False 
+    )
+
+    return training_dataloader, validation_dataloader
+```
+
+```{python}
+# get saliency for all obs given model, dataloader
+def _get_saliency(y_i, x_i, model):
+    # y_i, x_i = (y_i.to('cpu'), x_i.to('cpu'))
+    x_i.requires_grad_()
+    model.eval()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr = 0.01)
+    loss_fn = nn.MSELoss()
+
+    loss = loss_fn(model(x_i), y_i)
+    optimizer.zero_grad()
+    loss.backward()
+    out = x_i.grad
+    return out
+```
+
+```{python}
+for exp_name, exp_yvar in [(i,j) for i in exp_names for j in exp_yvars]:
+
+    models_info = _identify_1mods_models(exp_name = exp_name, y_var = exp_yvar)
+    if models_info == []: # confirm there are models to load (e.g. exp_name is eres in non eres exp.)
+        pass
+    else:
+        for model_info in models_info:
+            print(exp_name, exp_yvar, model_info)
+
+            
+            break
+        break
+```
+
+```{python}
+# setup 
+saliency_loci = pd.concat([vals_lookup_df, vals_lookup_df['snp'].str.split('_', expand=True).rename(columns={0:'chrom', 1:'pos'})], axis=1)
+saliency_loci.chrom = saliency_loci.chrom.str.replace('S', '')
+
+for e in ['chrom', 'pos']: saliency_loci.loc[:, e] = saliency_loci.loc[:, e].astype(int)
+
+saliency_loci = saliency_loci.reset_index().rename(columns={'index':'saliency_idx'})
+saliency_loci['chrom'] = saliency_loci['chrom'].astype(int)
+saliency_loci['pos'] = saliency_loci['pos'].astype(int)
+
+pq.write_table(
+    pa.Table.from_pandas(
+    saliency_loci),
+    cache_path+"alternate_1mods_salience_loci.parquet"
+    )
+
+saliency_loci.head()
+```
+
+```{python}
+for exp_name, exp_yvar in [(i,j) for i in exp_names for j in exp_yvars]:
+
+    models_info = _identify_1mods_models(exp_name = exp_name, y_var = exp_yvar)
+    if models_info == []: # confirm there are models to load (e.g. exp_name is eres in non eres exp.)
+        pass
+    else:
+        model_names = []
+        trn_sal = []
+        val_sal = []
+
+        for model_info in tqdm(models_info[:2]):
+        # for model_info in tqdm(models_info): #TODO
+            print(exp_name, exp_yvar, model_info)
+            def _get_saliency_for_dataloader(model_info, dl):
+                # add in salience to all entries
+                all_grads = [
+                    _get_saliency(
+                        y_i = y_i.to('cuda'), 
+                        x_i = x_i.to('cuda'),
+                        model = 
+                        torch.load(model_info['path']).to('cuda')
+                        # detach and transfer to cpu to prevent this from blowing up       
+                        ).detach().cpu()
+
+                        for idx, (y_i, x_i) in 
+                            enumerate(iter(dl))
+                            
+                        ]
+
+                all_grads = torch.concat(all_grads)
+                # Saliency across all obs _not_ all genotypes
+                saliency, _ = all_grads.reshape(all_grads.shape[0], 4, -1).abs().max(dim=1) # returns values, indices for max. Thats why the later is discarded
+                # then repeat to get the maximum at the per-snp level
+                saliency = saliency.max(axis=0)[0]
+                return saliency
+                
+
+            training_dataloader, validation_dataloader = _prep_data_to_dls(
+                    # obs_geno_lookup,
+                    vals = vals,
+                    batch_size = batch_size,
+                    params_data = {
+                        'y_var': y_var,
+                        # set residual prediction strategy correctly
+                        'y_resid':       ['None' if re.findall('_eres_', e) == [] else 'naive_mean' for e in [exp_name]][0],
+                        'y_resid_strat': ['None' if re.findall('_eres_', e) == [] else 'naive_mean' for e in [exp_name]][0], # ignored if y_resid == "None"
+                        'holdout_parents': model_info['holdout_parents'].split('_')
+                        }
+                    )
+        
+
+            model_names.append(model_info['model_name'])
+
+            trn_sal.append( _get_saliency_for_dataloader(model_info = model_info, dl = training_dataloader)   )
+            val_sal.append( _get_saliency_for_dataloader(model_info = model_info, dl = validation_dataloader) )
+            
+            # break
+
+        # concat across replicates and write out a reference salience dataframe
+        if_eres = ["" if re.findall("_eres_", e) == [] else "eres_" for e in [exp_name]][0]
+        model_cols = [e.replace('vnn__', f'{if_eres}').replace('.pt', '') for e in model_names]
+
+        for split, dat_sal in (('trn', trn_sal),('val', val_sal)):
+            pq.write_table(pa.Table.from_pandas(pd.DataFrame(
+                torch.concatenate([e[:, None] for e in dat_sal], axis=1).numpy(), 
+                columns=model_cols)),
+                cache_path+f"alternate_1mods_salience_{split}_{if_eres}{model_info['model_name'].split('__')[1]}.parquet"
+                )
+```
+
+```{python}
+Stop here!
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{python}
+# # get model results table
+
+# def _identify_1mods_models(
+#         exp_name = 'zma_g2f_individual_1mods',
+#         y_var = 'Yield_Mg_ha'):
+
+#     model_names = [e for e in os.listdir(f'../nbs_artifacts/{exp_name}/models/') if re.findall(y_var, e)]
+
+#     out = []
+#     for model_name in model_names:
+#         holdout_parents, replicate = model_name.split('__')[-1][:-3].split('_rep')
+#         out.append({
+#             'model_name':model_name,
+#             'y_var':y_var,
+#             'holdout_parents':holdout_parents, 
+#             'replicate':int(replicate),
+#             'path':f'../nbs_artifacts/{exp_name}/models/{model_name}',
+#         })
+
+#     return out   
+
+
+# model_info = _identify_1mods_models(
+#         exp_name = 'zma_g2f_individual_1mods',
+#         y_var = 'Yield_Mg_ha')
+# model_info
+```
+
+```{python}
+# model = torch.load(
+#     model_info[0]['path']
+#     )
+# model_info[0]
 ```
 
 ```{python}
@@ -923,7 +1745,6 @@ def _get_saliency(y_i, x_i, model):
 ```
 
 ```{python}
-from tqdm import tqdm
 
 # add in salience to all entries
 for e in tqdm(model_info):
@@ -948,19 +1769,16 @@ for e in tqdm(model_info):
     e['saliency'] = saliency
 ```
 
-
-
-
 ```{python}
 # setup 
-saliency_loci = pd.DataFrame(vals_loci, columns=['x'])['x'].str.split('_', expand=True).rename(columns={0:'chrom', 1:'pos'})
+saliency_loci = pd.concat([vals_lookup_df, vals_lookup_df['snp'].str.split('_', expand=True).rename(columns={0:'chrom', 1:'pos'})], axis=1)
 saliency_loci.chrom = saliency_loci.chrom.str.replace('S', '')
-for e in list(saliency_loci): saliency_loci.loc[:, e] = saliency_loci.loc[:, e].astype(int)
+
+for e in ['chrom', 'pos']: saliency_loci.loc[:, e] = saliency_loci.loc[:, e].astype(int)
 
 saliency_loci = saliency_loci.reset_index().rename(columns={'index':'saliency_idx'})
 saliency_loci['chrom'] = saliency_loci['chrom'].astype(int)
 saliency_loci['pos'] = saliency_loci['pos'].astype(int)
-
 
 saliency_loci
 ```
@@ -976,6 +1794,23 @@ for e in model_info:
     fig.show()
 ```
 
+```{python}
+## group by gene 
+
+for e in model_info:
+    # saliency = model_info[0]['saliency']
+    saliency = e['saliency']
+    saliency_loci['saliency'] = saliency.numpy().max(axis = 0)   
+    tmp = saliency_loci.copy() # copy because we insert the values directly into a col of the df
+    tmp = tmp.groupby(['chrom', 'entry']).agg(
+        saliency = ('saliency', 'max'),
+        pos = ('pos', 'max')        
+        ).reset_index()
+
+    tmp = tmp.sort_values(['chrom', 'pos']).reset_index(drop = True)
+    fig = px.scatter(tmp, x = tmp.index, y = 'saliency', color='chrom')
+    fig.show()
+```
 
 ```{python}
 x = np.concatenate([e['saliency'].numpy().max(axis = 0)[:, None] for e in model_info], axis=1)
@@ -998,6 +1833,7 @@ _ = [print(f"""{i},{j}, {
 
 ```{python}
 px.line(y = x.var(axis=1))
+px.line(y = x.mean(axis=1))
 ```
 
 
@@ -1016,319 +1852,8 @@ fig = px.scatter(tmp, x = tmp.index, y = 'saliency', color='chrom')
 fig.show()
 ```
 
-
-
-
 ```{python}
-
-sals = []
-model = model.to('cuda')
-```
-
-```{python}
-y_i, x_i = next(iter(training_dataloader))
-y_i.device
-```
-
-```{python}
-
-sal = _get_saliency(
-    y_i = y_i, 
-    x_i = x_i,
-    model = model)
-
-sals.append([sal.detach().cpu()])
-```
-
-```{python}
-# this is blowing up the memory usage.
-all_grads = [
-    _get_saliency(
-        y_i = y_i.to('cuda'), 
-        x_i = x_i.to('cuda'),
-        model = 
-        torch.load(
-            model_info[0]['path']
-            ).to('cuda')
-            # detach and transfer to cpu to prevent this from blowing up       
-        ).detach().cpu()
-
-        for idx, (y_i, x_i) in 
-            enumerate(iter(training_dataloader))
-            
-        ]
-```
-
-
-
-
-
-
-
-
-
-```{python}
-y_i, x_i = next(iter(training_dataloader))
-
-
-_get_saliency(
-    y_i = y_i, 
-    x_i = x_i,
-    model = model).detach()
-
-# # y_i, x_i = (y_i.to('cpu'), x_i.to('cpu'))
-
-# model.to('cuda')(x_i)
-```
-
-
-
-```{python}
-# model = torch.load('./vnnCG102_PHW52_PHB47_rep00.pt')
-model = torch.load(
-    '../nbs_artifacts/zma_g2f_individual_1mods/models/'+[
-    'vnn__Plant_Height_cm__CG102_PHW52_PHB47_rep00.pt',
-    'vnn__Plant_Height_cm__LH185_PHN82_PB80_rep00.pt',
-    'vnn__Plant_Height_cm__LH244_PHZ51_LH195_rep00.pt',
-    'vnn__Plant_Height_cm__LH82_PHT69_DK3IIH6_rep00.pt',
-    'vnn__Plant_Height_cm__PHK76_LH198_PHP02_rep00.pt'][0]
-    )
-```
-
-```{python}
-# y_i.shape
-```
-
-```{python}
-y_i, x_i = next(iter(training_dataloader))
-y_i, x_i = (y_i.to('cpu'), x_i.to('cpu'))
-```
-
-```{python}
-# x_i.requires_grad_()
-# model.eval()
-
-# optimizer = torch.optim.Adam(model.parameters(), lr = 0.01)
-# loss_fn = nn.MSELoss()
-
-# loss = loss_fn(model(x_i), y_i)
-# optimizer.zero_grad()
-# loss.backward()
-```
-
-```{python}
-# x_i.grad.shape
-```
-
-```{python}
-# get saliency for all obs given model, dataloader
-def _get_saliency(y_i, x_i, model):
-    y_i, x_i = (y_i.to('cpu'), x_i.to('cpu'))
-    x_i.requires_grad_()
-    model.eval()
-
-    optimizer = torch.optim.Adam(model.parameters(), lr = 0.01)
-    loss_fn = nn.MSELoss()
-
-    loss = loss_fn(model(x_i), y_i)
-    optimizer.zero_grad()
-    loss.backward()
-    out = x_i.grad
-    return out
-
-
-# ~2min
-all_grads = [
-    _get_saliency(
-        y_i = y_i, 
-        x_i = x_i,
-        model = model)
-        for idx, (y_i, x_i) in 
-            enumerate(iter(training_dataloader))
-            
-        ]
-
-# [torch.Size([256, 144468
-
-all_grads = torch.concat(all_grads)
-# Saliency across all obs _not_ all genotypes
-saliency, _ = all_grads.reshape(all_grads.shape[0], 4, -1).abs().max(dim=1)
-
-px.histogram(saliency[0, :].numpy(), log_y=True)
-```
-
-```{python}
-# saliency, _ = x_i.grad.reshape(256, 4, -1).abs().max(dim=1)
-# px.histogram(saliency[0, :].numpy(), log_y=True)
-```
-
-```{python}
-saliency_loci = pd.DataFrame(vals_loci, columns=['x'])['x'].str.split('_', expand=True).rename(columns={0:'chrom', 1:'pos'})
-saliency_loci.chrom = saliency_loci.chrom.str.replace('S', '')
-for e in list(saliency_loci): saliency_loci.loc[:, e] = saliency_loci.loc[:, e].astype(int)
-
-saliency_loci = saliency_loci.reset_index().rename(columns={'index':'saliency_idx'})
-saliency_loci
-```
-
-```{python}
-saliency_loci['saliency'] = saliency.numpy().max(axis = 0)
-
-saliency_loci['chrom'] = saliency_loci['chrom'].astype(int)
-saliency_loci['pos'] = saliency_loci['pos'].astype(int)
-
-saliency_loci.info()
-```
-
-```{python}
-saliency_loci = saliency_loci.sort_values(['chrom', 'pos']).reset_index(drop = True)
-saliency_loci.head()
-```
-
-```{python}
-px.scatter(saliency_loci, x = saliency_loci.index, y = 'saliency', color='chrom')
-```
-
-
-
-
-
-```{python}
-gapit_res.loc[:, 'negLogP'] = -np.log(gapit_res.loc[:, 'pvalue'].to_numpy())
-
-px.scatter(gapit_res, x = gapit_res.index, y = 'negLogP', color= 'chrom')
-```
-
-```{python}
-#FIXME This shouldn't happen but it appears that the sites in gapit_res are not a subset of those used in the vnn but instead partially overlap.
-# There should be 30k obs and they should _all_ be present.
-
-# this makes me wonder if they are accurate or not. 
-gapit_vnn = gapit_res.merge(saliency_loci)
-gapit_vnn.shape
-```
-
-```{python}
-px.scatter(
-    gapit_vnn, 
-    x = 'saliency', y = 'negLogP', color= 'chrom')
-```
-
-```{python}
-import scipy
-
-
-scipy.stats.spearmanr(
-    gapit_vnn.loc[:, ['negLogP']].to_numpy().squeeze(), 
-    gapit_vnn.loc[:, ['saliency']].to_numpy().squeeze()
-)
-```
-
-```{python}
-chrom = 1
-df1 = saliency_loci
-df1_y = 'saliency'
-df2 = gapit_res.rename(columns={'Chr':'chrom', 'Pos':'pos'})
-df2_y = 'P.value'
-
-df1 = df1.loc[(df1.chrom == chrom), ['pos', df1_y]].to_numpy()
-df2 = df2.loc[(df2.chrom == chrom), ['pos', df2_y]].to_numpy()
-
-# find the closest df2_y entry based on position
-# get indexes of the smallest absolute distance based on position
-idxs = [np.argmin( np.abs(df1[i, 0] - df2[:, 0]) ) for i in range(df1.shape[0])]
-
-# bind the indexed closest values to the saliences
-out = np.concatenate([df1, df2[idxs, 1][:, None]], axis = 1)
-
-pd.DataFrame(out, columns=['pos'])
-
-
-
-```
-
-```{python}
-# match up by distance:
-
-gapit_res# = gapit_res.rename(columns={'Chr':'chrom', 'Pos':'pos'})
-
-for i in saliency_loci.index:
-    break
-
-
-mask = (saliency_loci.index == 1)
-chrom, pos = saliency_loci.loc[mask, ['chrom', 'pos']].values[0].tolist()
-
-mask2 = (
-    (gapit_res.chrom == chrom) &
-    (gapit_res.pos == pos)) 
-
-gapit_res.loc[mask2, ]
-```
-
-```{python}
-# np.correlate(
-#     gapit_vnn.loc[:, ['negLogP']].to_numpy().squeeze(), 
-#     gapit_vnn.loc[:, ['saliency']].to_numpy().squeeze(), 
-# )
-```
-
-```{python}
-M_list[0].row_info['100285210']
-parsed_kegg_gene_entries
-```
-
-```{python}
-import re
-from tqdm import tqdm
-
-gene_df = list() 
-
-for e in tqdm(parsed_kegg_gene_entries):
-    chrm, pos = e['POSITION'].split(':')
-    pos = sorted(re.findall('\d+\.\.\d+', pos)[0].split('..'))
-
-    xs = range(int(pos[0]), int(pos[1]))
-    gene_df.append(pd.DataFrame({
-        'gene':[e['ENTRY'].split(' ')[0] for i in xs],
-        'chrm':[int(chrm) for i in xs],
-        'pos':xs,
-        })
-        )
-
-gene_df = pd.concat(gene_df).reset_index(drop=True)
-```
-
-```{python}
-gapit_res = gapit_res.merge(gene_df.rename(columns={'chrm':'Chr', 'pos':'Pos'}))
-gapit_res.head()
-```
-
-```{python}
-tmp = gapit_res.merge(meta.loc[:, ['gene', 'sal']]).drop_duplicates()
-tmp.head()
-```
-
-```{python}
-tmp = tmp.groupby('gene').agg(sal = ('sal', 'max'),
-                        P = ('P.value', 'min')
-                        ).reset_index()
 tmp
-```
-
-```{python}
-import plotnine as p9
-
-(p9.ggplot(tmp, p9.aes(x = 'P', y = 'sal'))+
- p9.geom_point()
- )
-```
-
-```{python}
-np.correlate(
-np.asarray(tmp.loc[:, ['P']]).squeeze(),    
-np.asarray(tmp.loc[:, ['sal']]).squeeze(),    
-)
 ```
 
 
@@ -1349,95 +1874,116 @@ np.asarray(tmp.loc[:, ['sal']]).squeeze(),
 ### GWAS
 
 ```{python}
-def _get_gwas_results(
-    gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_gapit/output/',
-    gwas_phno = 'Ear_Height_cm',
-    gwas_geno = '5_Genotype_Data_All_Years_acgt_30000'
-    ):
-    gwas_result_path = gwas_output_dir+f'phno_{gwas_phno}__{gwas_geno}'
-    gwas_result_name = [e for e in os.listdir(gwas_result_path) if re.match('GAPIT.Association.GWAS_Results', e)][0]
-    out = pd.read_csv(gwas_result_path+'/'+gwas_result_name)
-    return out
+# def _get_gwas_results(
+#     gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_gapit/output/',
+#     gwas_phno = 'Ear_Height_cm',
+#     gwas_geno = '5_Genotype_Data_All_Years_acgt_30000'
+#     ):
+#     gwas_result_path = gwas_output_dir+f'phno_{gwas_phno}__{gwas_geno}'
+#     gwas_result_name = [e for e in os.listdir(gwas_result_path) if re.match('GAPIT.Association.GWAS_Results', e)][0]
+#     out = pd.read_csv(gwas_result_path+'/'+gwas_result_name)
+#     return out
 ```
 
 ```{python}
-gapit_res = _get_gwas_results(
-    gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_gapit/output/',
-    gwas_phno = 'Ear_Height_cm',
-    gwas_geno = '5_Genotype_Data_All_Years_acgt_30000'
-    )
+# # os.listdir('../nbs_artifacts/zma_g2f_individual_gapit/output')
+
+# # [e.split('__')[0].replace('phno_', '') for e in os.listdir('../nbs_artifacts/zma_g2f_individual_gapit_blink/output')]
+
+
+# # candidate ys
+# sum([[e, 'eres_'+e] for e in 
+# ['Yield_Mg_ha',
+#  'Silk_DAP_days',
+#  'Plant_Height_cm',
+#  'Pollen_DAP_days',
+#  'Ear_Height_cm']], [])
 ```
 
 ```{python}
-def _standardize_names(df, name_dict = {'Pos':'pos', 'Chr':'chrom'}):
-    "Replace specified names and then remove any '.' in any name and set all to lowercase"
-    df = df.rename(columns = name_dict)
-    df = df.rename(columns = {e:e.replace('.', '').lower() for e in list(df)})
-    return df
+# gapit_res = _get_gwas_results(
+#     gwas_output_dir = '../nbs_artifacts/zma_g2f_individual_gapit_blink/output/',
+#     gwas_phno = 'Yield_Mg_ha',
+#     # gwas_phno = 'Ear_Height_cm',
+#     gwas_geno = '5_Genotype_Data_All_Years_vals_loci'
+#     )
 ```
 
 ```{python}
-gapit_res = _standardize_names(gapit_res)
-gapit_res
+# def _standardize_names(df, name_dict = {'Pos':'pos', 'Chr':'chrom'}):
+#     "Replace specified names and then remove any '.' in any name and set all to lowercase"
+#     df = df.rename(columns = name_dict)
+#     df = df.rename(columns = {e:e.replace('.', '').lower() for e in list(df)})
+#     return df
 ```
 
 ```{python}
-# are the snps == S+chrom+_+pos ?
+# gapit_res = _standardize_names(gapit_res)
 
+# gapit_res['nlogp'] = -np.log(gapit_res['pvalue'])
 
-
-# are they a subset of vals_loci? (vals_loci is a subset of ACGT_gene_slice_loci )
-
-vl = pd.DataFrame({'snp':vals_loci})
-gapit_res.loc[:, ['snp']].merge(vl).shape[0], vl.merge(gapit_res.loc[:, ['snp']]).shape[0]
+# gapit_res
 ```
 
 ```{python}
-tmp = gapit_res.assign(g = 1).merge(vl.assign(v = 1), how= 'outer')
+# px.scatter(gapit_res, x = gapit_res.index, y = 'nlogp', color='chrom')
 ```
 
 ```{python}
-tmp.loc[(tmp.g != tmp.v), ]
+
+# tmp = saliency_loci.merge(gapit_res)
+# tmp['flag'] = ''
+# tmp.loc[(tmp['h&bpvalue'] < 0.05), 'flag'] = 'sig'
+
+
+# mask = (tmp['saliency'] > np.quantile(
+#     tmp['saliency'],
+#     q = .95
+# ))
+
+# tmp.loc[mask, 'flag'] = tmp.loc[mask, 'flag']+'sal'
+
+# px.scatter(
+#     tmp, 
+#     x = 'saliency', 
+#     y = 'nlogp', 
+#     color='flag')
 ```
 
 ```{python}
-len(vals_loci), len(list(set(vals_loci)))
+# scipy.stats.spearmanr(tmp.nlogp, tmp.saliency)
 ```
-
-```{python}
-# What about relative to the superset of vals_loci?
-
-al = pd.DataFrame({'snp': sum(ACGT_gene_slice_loci, [])})
-(
-    gapit_res.loc[:, ['snp']].merge(al).shape[0], 
-    al.merge(gapit_res.loc[:, ['snp']]).shape[0]
-)
-```
-
 
 
 ```{python}
-#TODO confirm we can match up the inputs. The gwas input should be a subset of the vnn input.
-len(vals_loci)
+# x = torch.zeros((2,3))
+# x[0, 0] = 1
+# x[1, 1] = 1
+# x # design matrix
 ```
 
 ```{python}
-with open('../nbs_artifacts/zma_g2f_individual_gapit/genotypes_holding/zma_filter_pos_30000.txt', 'r') as f:
-    dat = f.readlines()
-dat = ['S'+e.replace('\n', '').replace('\t', '_') for e in dat]
+# # marker effects
+# N_s  = torch.ones((1)) # shared variance
+# N_mu = torch.rand((3)) # indpendent means
+
+
 ```
 
 ```{python}
-x = [pd.DataFrame(e, columns=['site']) for e in [vals_loci, dat]]
-for i in range(2): x[i].loc[:, ['vals_loci', 'dat'][i]] = 1
-
-[print(e.shape) for e in x]
-
-x[0].merge(x[1], how= 'outer')
+# # N_mu * x
+# torch.distributions.normal.Normal(
+#     N_mu,
+#     N_s
+#     ).rsample() @ x[0, ]
 ```
 
-
-
+```{python}
+# torch.distributions.normal.Normal(
+#     torch.ones((3)),
+#     1
+#     ).rsample() * x[0, ]
+```
 
 
 ```{python}
